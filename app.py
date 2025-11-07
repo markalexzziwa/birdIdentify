@@ -20,9 +20,15 @@ def load_video_maker():
     if not os.path.exists(path):
         st.error(f"Missing: `{path}` — Upload it to your app folder!")
         return None
+    
     try:
-        maker = torch.load(path, map_location="cpu")
-        st.success("Video generator loaded!")
+        # FIXED: Allow custom class loading (safe for your trusted .pth)
+        import torch.serialization
+        torch.serialization.add_safe_globals([__main__.AllBirdsVideoMaker])
+        
+        # Load with weights_only=False (safe for custom objects)
+        maker = torch.load(path, map_location="cpu", weights_only=False)
+        st.success("✅ Video generator loaded!")
         return maker
     except Exception as e:
         st.error(f"Failed to load .pth: {e}")
