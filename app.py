@@ -191,76 +191,113 @@ def generate_video(bird_name, image_path, output_path):
         bird_info = get_bird_info(bird_name)
         story = generate_vivid_bird_story(bird_name, bird_info["description"], bird_info["colors"])
         
-        # Generate audio
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp_audio:
-            audio_path = tmp_audio.name
+        # Generate audio with error handling
+        audio_path = None
+        try:
+            audio_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3').name
             tts = gTTS(text=story, lang='en', slow=False)
             tts.save(audio_path)
-        
-        # Create video
-        audio = AudioFileClip(audio_path)
-        duration = audio.duration
-        
+        except Exception as e:
+            st.error(f"Text-to-speech failed: {str(e)}")
+            return None
+
+        # Load audio
+        try:
+            audio = AudioFileClip(audio_path)
+            duration = audio.duration
+        except Exception as e:
+            st.error(f"Audio loading failed: {str(e)}")
+            if audio_path and os.path.exists(audio_path):
+                os.unlink(audio_path)
+            return None
+
         # Create image clip
-        img_clip = ImageClip(image_path).set_duration(duration).resize(height=720)
-        
-        # Add captions (optional - may fail if ImageMagick not available)
+        try:
+            img_clip = ImageClip(image_path).set_duration(duration).resize(height=720)
+            img_clip = img_clip.set_fps(24)
+        except Exception as e:
+            st.error(f"Image clip failed: {str(e)}")
+            audio.close()
+            if audio_path and os.path.exists(audio_path):
+                os.unlink(audio_path)
+            return None
+
+        # Add subtle zoom effect (optional, makes it dynamic)
+        img_clip = img_clip.resize(lambda t: 1 + 0.05 * t / duration)  # Slow zoom-in
+
+        # Create caption clips
         caption_clips = []
         try:
             words = story.split()
             total_words = len(words)
-            avg_time_per_word = duration / total_words
-            
-            i = 0
-            while i < total_words:
-                remaining = total_words - i
-                chunk_size = random.randint(2, min(6, remaining)) if remaining >= 2 else remaining
-                chunk_words = words[i:i+chunk_size]
-                chunk_text = " ".join(chunk_words)
-                chunk_start = i * avg_time_per_word
-                chunk_duration = chunk_size * avg_time_per_word
-                
-                txt_clip = TextClip(
-                    chunk_text,
-                    fontsize=40,
-                    font='Arial-Bold',
-                    color='white',
-                    stroke_color='black',
-                    stroke_width=2,
-                    method='caption',
-                    size=(img_clip.w, None),
-                    align='center'
-                )
-                txt_clip = txt_clip.set_position(('center', 'bottom')).set_start(chunk_start).set_duration(chunk_duration)
-                caption_clips.append(txt_clip)
-                
-                i += chunk_size
-        except Exception as e:
-            # If TextClip fails (ImageMagick not available), continue without captions
-            pass
-        
-        # Combine video and audio
-        if caption_clips:
-            final = CompositeVideoClip([img_clip.set_audio(audio)] + caption_clips)
-        else:
-            final = img_clip.set_audio(audio)
-        
-        final.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac', verbose=False, logger=None)
-        
-        # Cleanup
-        try:
-            os.unlink(audio_path)
-            audio.close()
-            final.close()
-            img_clip.close()
-        except:
-            pass
-        
-        return output_path
-    except Exception as e:
-        st.error(f"Error generating video: {str(e)}")
-        return None
+            if total_words > 0:
+                avg_time_per_word = duration / total_words
+                i = 0
+                while i < total_words:
+                    chunk_size = min(random.randint(3, 6), total_words - i)
+                    chunk_words = words[i:i + chunk_size]
+                    chunk_text = " ".join(chunk_words)
+                    start_time = i * avg_time_per_word
+                    chunk_duration = chunk_size * avg_time_per_word
 
+                    txt_clip = TextClip(
+                        chunk_text,
+                        fontsize=36,
+                        font='Arial-Bold',
+                        color='white',
+                        stroke_color='black',
+                        stroke_width=2,
+                        size=(img_clip.w * 0.8, None),
+                        method='caption',
+                        align='center'
+                    ).set_position(('center', 'bottom')).set_start(start_time).set_duration(chunk_duration).margin(bottom=30, opacity=0)
+
+                    caption_clips.append(txt_clip)
+                    i += chunk_size
+        except Exception as e:
+            st.warning("Captions skipped (ImageMagick may not be installed).")
+
+        # Final video composition
+        video_with_audio = img_clip.set_audio(audio)
+        if caption_clips:
+            final_clip = CompositeVideoClip([video_with_audio] + caption_clips)
+        else:
+            final_clip = video_with_audio
+
+        # Write video with safe settings
+        final_clip.write_videofile(
+            output_path,
+            fps=24,
+            codec='libx264',
+            audio_codec='aac',
+            temp_audiofile='temp-audio.m4a',
+            remove_temp=True,
+            threads=2,
+            preset='medium',
+            verbose=False,
+            logger=None
+        )
+
+        # Cleanup
+        final_clip.close()
+        img_clip.close()
+        audio.close()
+        if audio_path and os.path.exists(audio_path):
+            os.unlink(audio_path)
+
+        return output_path
+
+    except Exception as e:
+        st.error(f"Video generation failed: {str(e)}")
+        # Cleanup on failure
+        for path in [audio_path, output_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except:
+                    pass
+        return None
+    
 # Global modern theme: fonts, colors, animations, components polish
 st.markdown('<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">', unsafe_allow_html=True)
 st.markdown("""<style>
@@ -499,45 +536,50 @@ with st.container():
                 # Generate video button
                 if st.button("🎬 Generate Video", key="generate_video_upload", use_container_width=True):
                     if 'upload_image' in st.session_state:
-                        with st.spinner("🎬 Generating video with narration..."):
-                            # Save image temporarily
-                            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_img:
-                                img_path = tmp_img.name
-                                st.session_state.upload_image.save(img_path)
-                            
-                            # Generate video
-                            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_video:
-                                video_path = tmp_video.name
-                            
+                        with st.spinner("🎬 Creating narrated video... (this may take 20–40 seconds)"):
+            # Save image
+                            img_path = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg').name
+                            st.session_state.upload_image.save(img_path)
+
+            # Output video path
+                            video_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+
                             video_file = generate_video(result['species'], img_path, video_path)
-                            
+
+            # Cleanup image early
+                            if os.path.exists(img_path):
+                                os.unlink(img_path)
+
                             if video_file and os.path.exists(video_file):
-                                # Display video
                                 with open(video_file, 'rb') as f:
                                     video_bytes = f.read()
+
+                # Show video
                                 st.video(video_bytes)
-                                
-                                # Download button
+
+                # Download button
                                 st.download_button(
                                     label="📥 Download Video",
                                     data=video_bytes,
                                     file_name=f"{result['species'].replace(' ', '_')}_story.mp4",
-                                    mime="video/mp4"
-                                )
-                                
-                                # Cleanup
+                                    mime="video/mp4",
+                                    key=f"download_{random.randint(1000,9999)}"
+                )
+
+                # Store in session state to persist
+                                st.session_state.last_video = video_bytes
+                                st.session_state.last_video_name = f"{result['species'].replace(' ', '_')}_story.mp4"
+
+                # Cleanup video file
                                 try:
-                                    os.unlink(img_path)
                                     os.unlink(video_path)
                                 except:
                                     pass
                             else:
-                                st.error("Failed to generate video. Please try again.")
+                                st.error("Failed to generate video. Try again.")
                     else:
-                        st.error("Image not found. Please upload an image again.")
-                
-                st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+                        st.warning("Please identify a bird first.")
+    
 
     with tab_camera:
         if 'camera_active' not in st.session_state:
@@ -608,45 +650,51 @@ with st.container():
                     """, unsafe_allow_html=True)
                     
                     # Generate video button
-                    if st.button("🎬 Generate Video", key="generate_video_camera", use_container_width=True):
-                        if 'camera_image' in st.session_state:
-                            with st.spinner("🎬 Generating video with narration..."):
-                                # Save image temporarily
-                                with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_img:
-                                    img_path = tmp_img.name
-                                    st.session_state.camera_image.save(img_path)
-                                
-                                # Generate video
-                                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_video:
-                                    video_path = tmp_video.name
-                                
+                    if st.button("🎬 Generate Video", key="generate_video_upload", use_container_width=True):
+                        if 'upload_image' in st.session_state:
+                            with st.spinner("🎬 Creating narrated video... (this may take 20–40 seconds)"):
+            # Save image
+                                img_path = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg').name
+                                st.session_state.upload_image.save(img_path)
+
+            # Output video path
+                                video_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+
                                 video_file = generate_video(result['species'], img_path, video_path)
-                                
+
+            # Cleanup image early
+                                if os.path.exists(img_path):
+                                    os.unlink(img_path)
+
                                 if video_file and os.path.exists(video_file):
-                                    # Display video
                                     with open(video_file, 'rb') as f:
                                         video_bytes = f.read()
-                                    st.video(video_bytes)
-                                    
-                                    # Download button
-                                    st.download_button(
-                                        label="📥 Download Video",
-                                        data=video_bytes,
-                                        file_name=f"{result['species'].replace(' ', '_')}_story.mp4",
-                                        mime="video/mp4"
-                                    )
-                                    
-                                    # Cleanup
-                                    try:
-                                        os.unlink(img_path)
-                                        os.unlink(video_path)
-                                    except:
-                                        pass
+
+                # Show video
+                                        st.video(video_bytes)
+
+                # Download button
+                                        st.download_button(
+                                            label="📥 Download Video",
+                                            data=video_bytes,
+                                            file_name=f"{result['species'].replace(' ', '_')}_story.mp4",
+                                            mime="video/mp4",
+                                            key=f"download_{random.randint(1000,9999)}"
+                )
+
+                # Store in session state to persist
+                                        st.session_state.last_video = video_bytes
+                                        st.session_state.last_video_name = f"{result['species'].replace(' ', '_')}_story.mp4"
+
+                # Cleanup video file
+                                        try:
+                                            os.unlink(video_path)
+                                        except:
+                                            pass
                                 else:
-                                    st.error("Failed to generate video. Please try again.")
+                                    st.error("Failed to generate video. Try again.")
                         else:
-                            st.error("Image not found. Please capture an image again.")
-                    
+                            st.warning("Please identify a bird first.")
                     st.markdown("</div>", unsafe_allow_html=True)
 
             if st.button("Stop Camera ⏹️", key="stop_camera_button", help="Click to stop camera preview"):
