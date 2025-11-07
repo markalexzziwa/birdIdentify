@@ -11,8 +11,11 @@ from gtts import gTTS
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, TextClip, CompositeVideoClip
 import tempfile
 import random
-
+import __main__      
+import torch.serialization
 #123
+
+torch.serialization.add_safe_globals([AllBirdsVideoMaker])
 @st.cache_resource
 def load_video_maker():
     """Load the full video generator from .pth file"""
@@ -408,18 +411,8 @@ with st.container():
             # Display result if available
             if 'upload_result' in st.session_state and st.session_state.upload_result:
                 result = st.session_state.upload_result
-                st.markdown("<div class='result-title'>🦅 Identification Result</div>", unsafe_allow_html=True)
-                st.markdown(f"""
-                <div class='result-item'>
-                    <div class='result-species'>{result['species']}</div>
-                    <div class='result-confidence'>Confidence: {result['confidence']:.2f}%</div>
-                </div>
-                """, unsafe_allow_html=True)
-                if 'upload_result' in st.session_state and st.session_state.upload_result:
-                    result = st.session_state.upload_result
-                    bird_name = result['species']
+                bird_name = result['species']
 
-    # Video button
                 if st.button("Generate Video Story", key="gen_video_upload", type="primary"):
                     video_path = generate_bird_video(bird_name)
                     if video_path:
@@ -430,8 +423,8 @@ with st.container():
                             data=video_bytes,
                             file_name=f"{bird_name.replace(' ', '_')}_STORY.mp4",
                             mime="video/mp4",
-                            key="download_upload")
-                
+                            key="download_upload"
+            )             
                 
 
     with tab_camera:
