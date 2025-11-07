@@ -1,0 +1,8 @@
+streamlit
+numpy
+pillow
+opencv-python
+torch
+torchvision
+gtts
+moviepy
