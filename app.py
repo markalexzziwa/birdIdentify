@@ -12,6 +12,25 @@ from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, Tex
 import tempfile
 import random
 
+#123
+@st.cache_resource
+def load_video_maker():
+    """Load the full video generator from .pth file"""
+    path = "all_birds_video_maker.pth"
+    if not os.path.exists(path):
+        st.error(f"Missing: `{path}` — Upload it to your app folder!")
+        return None
+    try:
+        maker = torch.load(path, map_location="cpu")
+        st.success("Video generator loaded!")
+        return maker
+    except Exception as e:
+        st.error(f"Failed to load .pth: {e}")
+        return None
+
+# Load once
+video_maker = load_video_maker()
+
 # Display logo (centered and resized to one-quarter of original dimensions)
 def _set_background_glass(img_path: str = "ugb1.png"):
     """Set a full-page background using the given image and add a translucent glass
@@ -131,6 +150,27 @@ def predict_species(model, label_map, image):
         st.error(f"Error during prediction: {str(e)}")
         return None
 
+def generate_bird_video(bird_name: str):
+    """Generate video for a bird using the loaded .pth maker"""
+    if video_maker is None:
+        st.error("Video maker not loaded.")
+        return None
+
+    if not bird_name.strip():
+        st.warning("Bird name is empty.")
+        return None
+
+    try:
+        with st.spinner(f"Creating video for **{bird_name}**..."):
+            video_path = video_maker(bird_name.strip())
+        if video_path and os.path.exists(video_path):
+            return video_path
+        else:
+            st.error("Video file was not created.")
+            return None
+    except Exception as e:
+        st.error(f"Video generation failed: {e}")
+        return None
 # Load model and label map
 model = load_model()
 label_map = load_label_map()
@@ -369,6 +409,22 @@ with st.container():
                     <div class='result-confidence'>Confidence: {result['confidence']:.2f}%</div>
                 </div>
                 """, unsafe_allow_html=True)
+                if 'upload_result' in st.session_state and st.session_state.upload_result:
+                    result = st.session_state.upload_result
+                    bird_name = result['species']
+
+    # Video button
+                if st.button("Generate Video Story", key="gen_video_upload", type="primary"):
+                    video_path = generate_bird_video(bird_name)
+                    if video_path:
+                        video_bytes = open(video_path, "rb").read()
+                        st.video(video_bytes)
+                        st.download_button(
+                            label="Download Video",
+                            data=video_bytes,
+                            file_name=f"{bird_name.replace(' ', '_')}_STORY.mp4",
+                            mime="video/mp4",
+                            key="download_upload")
                 
                 
 
