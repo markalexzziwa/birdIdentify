@@ -8,35 +8,26 @@ import torch.nn as nn
 from torchvision import transforms, models
 import numpy as np
 from gtts import gTTS
-from moviepy.editor import *
-from moviepy.audio.fx.all import audio_fadein, audio_fadeout
+from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, TextClip, CompositeVideoClip
 import tempfile
 import random
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. Load Video Maker (.pth) – MUST BE IN SAME FOLDER
-# ─────────────────────────────────────────────────────────────────────────────
-@st.cache_resource
-def load_video_maker():
-    if not os.path.exists("all_birds_video_maker.pth"):
-        st.error("`all_birds_video_maker.pth` not found! Upload it to your app folder.")
-        return None
-    return torch.load("all_birds_video_maker.pth", map_location="cpu")
-
-video_maker = load_video_maker()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Your Existing Functions (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
+# Display logo (centered and resized to one-quarter of original dimensions)
 def _set_background_glass(img_path: str = "ugb1.png"):
+    """Set a full-page background using the given image and add a translucent glass
+    style to the main Streamlit block container so content appears on a frosted panel.
+    The image is embedded as a data URI to improve compatibility when deployed.
+    """
     try:
-        if not os.path.exists(img_path): return
+        if not os.path.exists(img_path):
+            return
         with open(img_path, "rb") as f:
             data = f.read()
         b64 = base64.b64encode(data).decode()
         css = f"""
         <style>
         .stApp {{
+            /* Apply a white overlay so the image appears very subtle, requiring focus to notice */
             background-image: linear-gradient(rgba(255,255,255,0.92), rgba(255,255,255,0.92)), url("data:image/png;base64,{b64}");
             background-size: cover;
             background-position: center;
@@ -52,190 +43,425 @@ def _set_background_glass(img_path: str = "ugb1.png"):
         </style>
         """
         st.markdown(css, unsafe_allow_html=True)
-    except: pass
+    except Exception:
+        # If embedding fails, don't break the app
+        pass
 
+# Apply the background/glass style
 _set_background_glass("ugb1.png")
 
-# Model loading
+# Model loading and prediction functions
 @st.cache_resource
 def load_model():
+    """Load the ResNet34 model with trained weights"""
     try:
         model = models.resnet34(weights=None)
-        model.fc = nn.Linear(model.fc.in_features, 30)
+        num_classes = 30  # Based on label_map.json having 30 classes
+        model.fc = nn.Linear(model.fc.in_features, num_classes)
+        
+        # Load weights
         if os.path.exists("resnet34_weights.pth"):
-            model.load_state_dict(torch.load("resnet34_weights.pth", map_location="cpu"))
+            model.load_state_dict(torch.load("resnet34_weights.pth", map_location=torch.device('cpu')))
             model.eval()
             return model
         else:
             st.error("Model file not found: resnet34_weights.pth")
             return None
     except Exception as e:
-        st.error(f"Error loading model: {e}")
+        st.error(f"Error loading model: {str(e)}")
         return None
 
 @st.cache_data
 def load_label_map():
+    """Load the label mapping from JSON file"""
     try:
         if os.path.exists("label_map.json"):
             with open("label_map.json", "r") as f:
                 label_map = json.load(f)
-            return {v: k for k, v in label_map.items()}
+            # Reverse mapping: index -> bird name
+            idx_to_label = {v: k for k, v in label_map.items()}
+            return idx_to_label
         else:
             st.error("Label map file not found: label_map.json")
             return None
     except Exception as e:
-        st.error(f"Error loading label map: {e}")
+        st.error(f"Error loading label map: {str(e)}")
         return None
 
 def preprocess_image(image):
+    """Preprocess image for model input"""
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    if image.mode != 'RGB': image = image.convert('RGB')
-    return transform(image).unsqueeze(0)
+    
+    # Convert to RGB if needed
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    
+    image_tensor = transform(image).unsqueeze(0)
+    return image_tensor
 
 def predict_species(model, label_map, image):
+    """Predict bird species from image - returns top prediction only"""
     try:
-        tensor = preprocess_image(image)
+        # Preprocess image
+        image_tensor = preprocess_image(image)
+        
+        # Make prediction
         with torch.no_grad():
-            outputs = model(tensor)
-            probs = torch.nn.functional.softmax(outputs, dim=1)
-            top_prob, top_idx = torch.max(probs, dim=1)
-        idx = top_idx.item()
+            outputs = model(image_tensor)  # Shape: (batch_size, num_classes) = (1, 30)
+            probabilities = torch.nn.functional.softmax(outputs, dim=1)  # Apply softmax along class dimension
+            
+        # Get top prediction (dim=1 is the class dimension)
+        top_prob, top_index = torch.max(probabilities, dim=1)
+        
+        idx = top_index.item()
         prob = top_prob.item()
         bird_name = label_map.get(idx, f"Class {idx}")
-        return {'species': bird_name, 'confidence': prob * 100}
+        
+        result = {
+            'species': bird_name,
+            'confidence': prob * 100
+        }
+        
+        return result
     except Exception as e:
-        st.error(f"Prediction error: {e}")
+        st.error(f"Error during prediction: {str(e)}")
         return None
 
-# Load model & map
+# Load model and label map
 model = load_model()
 label_map = load_label_map()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Video Generation Function (using .pth)
-# ─────────────────────────────────────────────────────────────────────────────
-def generate_bird_video(bird_name):
-    if video_maker is None:
-        st.error("Video maker not loaded.")
-        return None
-
-    try:
-        with st.spinner(f"Generating video for **{bird_name}**..."):
-            video_path = video_maker(bird_name)
-        return video_path
-    except Exception as e:
-        st.error(f"Video generation failed: {e}")
-        return None
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. UI: Your Beautiful Design (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
+  
+# Global modern theme: fonts, colors, animations, components polish
 st.markdown('<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">', unsafe_allow_html=True)
 st.markdown("""<style>
-/* [Your full CSS from before – paste it here] */
-:root { --bg: #ffffff; --card: #ffffff; --muted: #1f2937; --text: #0f172a; --brand: #16a34a; --brand-2: #0e7490; --brand-3: #6d28d9; --ring: rgba(15,23,42,0.25); }
-html, body, .stApp { font-family: Inter, system-ui; color: var(--text); }
-.stApp::before { content: ""; position: fixed; inset: auto auto 10% -10%; width: 40vw; height: 40vw; background: radial-gradient(closest-side, rgba(34,197,94,0.18), transparent 65%); filter: blur(40px); z-index: 0; pointer-events: none; }
-.stApp::after { inset: -15% -10% auto auto; width: 35vw; height: 35vw; background: radial-gradient(closest-side, rgba(6,182,212,0.16), transparent 65%); }
-.hero { background: linear-gradient(145deg, rgba(15,23,42,0.9), rgba(15,23,42,0.55)); border: 1px solid rgba(255,255,255,0.06); border-radius: 20px; padding: 2.25rem; margin: 0.75rem 0 1.5rem 0; box-shadow: 0 12px 30px rgba(2,6,23,0.45); }
-.hero-title { font-family: Poppins; font-weight: 800; letter-spacing: -0.02em; font-size: clamp(1.8rem, 2.5vw + 1.2rem, 3.25rem); margin: 0 0 .35rem 0; background: linear-gradient(90deg, #0f172a, #1f2937 45%, #0b1220 85%); -webkit-background-clip: text; color: transparent; }
-.hero-sub { color: var(--muted); font-size: 1.05rem; line-height: 1.6; }
-.badge { font-size: .8rem; color: #0f172a; background: rgba(15,23,42,0.08); padding: .35rem .6rem; border-radius: 999px; border: 1px solid rgba(15,23,42,0.15); font-weight: 600; }
-.stButton > button { background: linear-gradient(135deg, var(--brand), #16a34a); color: white; border: 0; padding: .7rem 1rem; border-radius: 10px; width: 100%; font-weight: 600; box-shadow: 0 6px 14px rgba(16,185,129,0.28); transition: all .2s; }
+:root {
+  --bg: #ffffff;
+  --card: #ffffff;
+  --muted: #1f2937; /* slate-800 for strong contrast on light bg */
+  --text: #0f172a;  /* slate-900 as primary text */
+  --brand: #16a34a;
+  --brand-2: #0e7490;
+  --brand-3: #6d28d9;
+  --ring: rgba(15,23,42,0.25);
+}
+html, body, .stApp { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica Neue, Arial, "Apple Color Emoji", "Segoe UI Emoji"; color: var(--text); }
+.stApp::before, .stApp::after {
+  content: "";
+  position: fixed;
+  inset: auto auto 10% -10%;
+  width: 40vw;
+  height: 40vw;
+  background: radial-gradient(closest-side, rgba(34,197,94,0.18), transparent 65%);
+  filter: blur(40px);
+  z-index: 0;
+  pointer-events: none;
+}
+.stApp::after {
+  inset: -15% -10% auto auto;
+  width: 35vw;
+  height: 35vw;
+  background: radial-gradient(closest-side, rgba(6,182,212,0.16), transparent 65%);
+}
+.stApp .main .block-container { position: relative; z-index: 1; }
+.hero {
+  background: linear-gradient(145deg, rgba(15,23,42,0.9), rgba(15,23,42,0.55));
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 20px;
+  padding: 2.25rem;
+  margin: 0.75rem 0 1.5rem 0;
+  box-shadow: 0 12px 30px rgba(2,6,23,0.45);
+}
+.hero-title {
+  font-family: Poppins, Inter, system-ui;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  font-size: clamp(1.8rem, 2.5vw + 1.2rem, 3.25rem);
+  margin: 0 0 .35rem 0;
+  background: linear-gradient(90deg, #0f172a, #1f2937 45%, #0b1220 85%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.hero-sub {
+  color: var(--muted);
+  font-size: 1.05rem;
+  line-height: 1.6;
+}
+.hero-badges { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .85rem; }
+.badge {
+  font-size: .8rem;
+  color: #0f172a;
+  background: rgba(15,23,42,0.08);
+  padding: .35rem .6rem;
+  border-radius: 999px;
+  border: 1px solid rgba(15,23,42,0.15);
+  font-weight: 600;
+}
+.card {
+  background: #ffffff;
+  border: 1px solid rgba(2,6,23,0.08);
+  border-radius: 16px;
+  padding: 1.25rem;
+  box-shadow: 0 10px 24px rgba(2,6,23,0.06);
+  color: var(--text);
+}
+.card h4 { color: var(--text); margin: 0 0 .5rem 0; font-weight: 700; }
+.card .hint { color: var(--muted); font-size: .92rem; margin-bottom: .75rem; }
+.stButton > button {
+  background: linear-gradient(135deg, var(--brand), #16a34a);
+  color: white;
+  border: 0;
+  padding: .7rem 1rem;
+  border-radius: 10px;
+  width: 100%;
+  font-weight: 600;
+  box-shadow: 0 6px 14px rgba(16,185,129,0.28);
+  transition: transform .08s ease, filter .2s ease, box-shadow .2s ease;
+}
 .stButton > button:hover { filter: brightness(1.05); box-shadow: 0 10px 18px rgba(16,185,129,0.32); }
-.result-card { background: linear-gradient(135deg, #f8fafc 0%, #ffffff 100%); border: 2px solid rgba(16,185,129,0.2); border-radius: 12px; padding: 1.25rem; margin: 1rem 0; box-shadow: 0 4px 12px rgba(16,185,129,0.1); }
-.result-species { color: #0f172a; font-size: 1.1rem; font-weight: 600; }
-.result-confidence { color: #16a34a; font-size: 0.95rem; font-weight: 500; }
+.stButton > button:active { transform: translateY(1px); }
+[data-testid="stFileUploader"] div[data-testid="stFileUploaderDropzone"] {
+  border: 1px dashed rgba(2,6,23,0.15);
+  background: #f8fafc;
+  transition: border-color .2s ease, background .2s ease, box-shadow .2s ease;
+  border-radius: 14px;
+}
+[data-testid="stFileUploader"] div[data-testid="stFileUploaderDropzone"]:hover {
+  border-color: rgba(15,23,42,0.45);
+  box-shadow: 0 8px 20px rgba(2,6,23,0.08);
+  background: #f1f5f9;
+}
+[data-testid="stFileUploader"] section > div { color: #0f172a !important; }
+[data-testid="stFileUploader"] label { color: #0f172a !important; font-weight: 600; }
+[data-testid="stCameraInputLabel"] { color: #0f172a !important; font-weight: 600; }
+@keyframes fadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+.fade { animation: fadeUp .4s ease both; }
+.input-section {
+  background: rgba(2,6,23,0.75);
+  border-radius: 14px;
+  padding: 1rem;
+  margin: 0.5rem 0;
+  border: 1px solid rgba(255,255,255,0.06);
+}
+.section-title {
+  color: #0f172a;
+  font-size: 1.05rem;
+  margin-bottom: 0.75rem;
+  font-weight: 600;
+}
+.result-card {
+  background: linear-gradient(135deg, #f8fafc 0%, #ffffff 100%);
+  border: 2px solid rgba(16,185,129,0.2);
+  border-radius: 12px;
+  padding: 1.25rem;
+  margin: 1rem 0;
+  box-shadow: 0 4px 12px rgba(16,185,129,0.1);
+}
+.result-title {
+  color: #0f172a;
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+}
+.result-item {
+  background: #ffffff;
+  border-left: 4px solid #16a34a;
+  padding: 0.75rem 1rem;
+  margin: 0.5rem 0;
+  border-radius: 8px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+}
+.result-species {
+  color: #0f172a;
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+.result-confidence {
+  color: #16a34a;
+  font-size: 0.95rem;
+  font-weight: 500;
+}
 </style>""", unsafe_allow_html=True)
-
-# Logo + Hero
 try:
     _logo = Image.open("ugb1.png")
     _w, _h = _logo.size
-    _new_w, _new_h = max(1, _w // 2), max(1, _h // 2)
+    # Prevent zero or negative sizes
+    _new_w = max(1, _w // 2)  # Changed from 4 to 2 to make image twice as large
+    _new_h = max(1, _h // 2)
     _logo_small = _logo.resize((_new_w, _new_h), Image.LANCZOS)
+
+    # Hero header with logo and gradient title
     with st.container():
-        col1, col2 = st.columns([1, 3])
-        with col1: st.image(_logo_small, use_column_width=False)
-        with col2:
+        logo_col, text_col = st.columns([1, 3])
+        with logo_col:
+            st.image(_logo_small, use_column_width=False)
+        with text_col:
             st.markdown("<div class='hero-title'>Birds in Uganda</div>", unsafe_allow_html=True)
-            st.markdown("<div class='hero-sub'>Identify birds instantly. See a narrated video story of your bird.</div>", unsafe_allow_html=True)
-except: pass
+            st.markdown(
+                "<div class='hero-sub'>Identify birds from photos in seconds. Upload an image or use your camera to discover species, with a beautiful, distraction-free interface.</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                "<div class='hero-badges'><span class='badge'>Smart Vision</span><span class='badge'>On-device Capture</span><span class='badge'>UG Species Focus</span></div>",
+                unsafe_allow_html=True,
+            )
+        st.markdown("</div>", unsafe_allow_html=True)
+except Exception:
+    # If logo not found or cannot be opened, skip silently
+    pass
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. Tabs: Upload & Camera
-# ─────────────────────────────────────────────────────────────────────────────
-tab_upload, tab_camera = st.tabs(["Upload", "Camera"])
+# Remove old italic banner to reduce clutter and rely on hero subtitle
 
-with tab_upload:
-    uploaded_file = st.file_uploader("Upload bird image", type=['png', 'jpg', 'jpeg'])
-    if uploaded_file:
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Uploaded Image", use_column_width=True)
-        
-        if st.button("Identify & Generate Video", key="upload_btn"):
-            if model and label_map:
-                with st.spinner("Predicting..."):
-                    result = predict_species(model, label_map, image)
-                if result:
-                    st.session_state.predicted_bird = result['species']
-                    st.session_state.predicted_image = image
+# Main content container with modern layout
+with st.container():
+    # Section prompt
+    st.markdown(
+        """
+        <div style='text-align:center; margin: .5rem 0 1rem;'>
+            <p style='color:#0f172a; margin:0; font-weight:700; font-size:1rem; letter-spacing:.01em;'>
+                Choose how you want to identify a bird
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    tab_upload, tab_camera = st.tabs(["📁 Upload", "📷 Camera"])
+
+    with tab_upload:
+        st.markdown("<h4>📁 Upload Image</h4>", unsafe_allow_html=True)
+        st.markdown("<div class='hint'>PNG or JPEG. Clear, close-up shots improve results.</div>", unsafe_allow_html=True)
+        uploaded_file = st.file_uploader("Select a bird image", type=['png', 'jpg', 'jpeg'], key="uploader_file")
+        if uploaded_file is not None:
+            # Clear previous result when new image is uploaded
+            if 'upload_result' in st.session_state:
+                del st.session_state.upload_result
+            
+            image = Image.open(uploaded_file)
+            st.image(image, caption='Uploaded Image', use_column_width=True)
+            
+            if st.button("Identify Specie", key="identify_specie_upload_button"):
+                if model is not None and label_map is not None:
+                    with st.spinner("🔍 Analyzing image..."):
+                        result = predict_species(model, label_map, image)
+                    
+                    if result:
+                        # Store result in session state
+                        st.session_state.upload_result = result
+                        st.session_state.upload_image = image
+                    else:
+                        st.error("Failed to predict species. Please try again.")
                 else:
-                    st.error("Prediction failed.")
-            else:
-                st.error("Model not loaded.")
+                    st.error("Model or label map not loaded. Please check if the files exist.")
+            
+            # Display result if available
+            if 'upload_result' in st.session_state and st.session_state.upload_result:
+                result = st.session_state.upload_result
+                st.markdown("<div class='result-title'>🦅 Identification Result</div>", unsafe_allow_html=True)
+                st.markdown(f"""
+                <div class='result-item'>
+                    <div class='result-species'>{result['species']}</div>
+                    <div class='result-confidence'>Confidence: {result['confidence']:.2f}%</div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                
 
-        if 'predicted_bird' in st.session_state:
-            bird = st.session_state.predicted_bird
-            st.markdown(f"### {bird}")
-            st.markdown(f"**Confidence:** {st.session_state.get('confidence', 0):.1f}%")
+    with tab_camera:
+        if 'camera_active' not in st.session_state:
+            st.session_state.camera_active = False
 
-            if st.button("Generate Video Story", key="gen_video_upload"):
-                video_path = generate_bird_video(bird)
-                if video_path and os.path.exists(video_path):
-                    video_bytes = open(video_path, "rb").read()
-                    st.video(video_bytes)
-                    st.download_button("Download Video", video_bytes, file_name=f"{bird}.mp4", mime="video/mp4")
+        st.markdown("<h4>📷 Take Picture</h4>", unsafe_allow_html=True)
+        if not st.session_state.camera_active:
+            try:
+                _placeholder_path = "ub2.png"
+                if os.path.exists(_placeholder_path):
+                    with open(_placeholder_path, "rb") as _f:
+                        _data = _f.read()
+                    _b64 = base64.b64encode(_data).decode()
+                    _img_html = (
+                        f"<img src=\"data:image/png;base64,{_b64}\" "
+                        "style=\"width:100%; aspect-ratio:4/3; min-height:280px; object-fit:cover; "
+                        "border-radius:12px; margin-bottom:0.75rem; box-shadow: inset 0 0 40px rgba(0,0,0,0.6);\"/>")
+                    st.markdown(_img_html, unsafe_allow_html=True)
                 else:
-                    st.error("Video generation failed.")
+                    st.markdown(
+                        "<div style='width:100%; aspect-ratio:4/3; min-height:280px; background:linear-gradient(180deg,#0b1220,#0b1220 60%, #0f172a); border-radius:12px; margin-bottom:0.75rem; box-shadow: inset 0 0 40px rgba(0,0,0,0.6);'></div>",
+                        unsafe_allow_html=True,
+                    )
+            except Exception:
+                st.markdown(
+                    "<div style='width:100%; aspect-ratio:4/3; min-height:280px; background:linear-gradient(180deg,#0b1220,#0b1220 60%, #0f172a); border-radius:12px; margin-bottom:0.75rem; box-shadow: inset 0 0 40px rgba(0,0,0,0.6);'></div>",
+                    unsafe_allow_html=True,
+                )
 
-with tab_camera:
-    camera_photo = st.camera_input("Take a photo")
-    if camera_photo:
-        image = Image.open(camera_photo)
-        st.image(image, caption="Captured Photo", use_column_width=True)
-        
-        if st.button("Identify & Generate Video", key="camera_btn"):
-            if model and label_map:
-                with st.spinner("Predicting..."):
-                    result = predict_species(model, label_map, image)
-                if result:
-                    st.session_state.predicted_bird = result['species']
-                    st.session_state.predicted_image = image
-            else:
-                st.error("Model not loaded.")
+            def _start_camera():
+                st.session_state.camera_active = True
 
-        if 'predicted_bird' in st.session_state:
-            bird = st.session_state.predicted_bird
-            st.markdown(f"### {bird}")
+            st.button("Start Camera 📷", key="use_camera_button", on_click=_start_camera)
 
-            if st.button("Generate Video Story", key="gen_video_camera"):
-                video_path = generate_bird_video(bird)
-                if video_path and os.path.exists(video_path):
-                    video_bytes = open(video_path, "rb").read()
-                    st.video(video_bytes)
-                    st.download_button("Download Video", video_bytes, file_name=f"{bird}.mp4", mime="video/mp4")
+        if st.session_state.camera_active:
+            camera_photo = st.camera_input("Take a photo", key="camera_input")
+            if camera_photo is not None:
+                # Clear previous result when new photo is captured
+                if 'camera_result' in st.session_state:
+                    del st.session_state.camera_result
+                
+                image = Image.open(camera_photo)
+                st.image(image, caption='Captured Photo', use_column_width=True)
+                
+                if st.button("Identify Specie", key="identify_specie_camera_button"):
+                    if model is not None and label_map is not None:
+                        with st.spinner("🔍 Analyzing image..."):
+                            result = predict_species(model, label_map, image)
+                        
+                        if result:
+                            # Store result in session state
+                            st.session_state.camera_result = result
+                            st.session_state.camera_image = image
+                        else:
+                            st.error("Failed to predict species. Please try again.")
+                    else:
+                        st.error("Model or label map not loaded. Please check if the files exist.")
+                
+                # Display result if available
+                if 'camera_result' in st.session_state and st.session_state.camera_result:
+                    result = st.session_state.camera_result
+                    st.markdown("<div class='result-title'>🦅 Identification Result</div>", unsafe_allow_html=True)
+                    st.markdown(f"""
+                    <div class='result-item'>
+                        <div class='result-species'>{result['species']}</div>
+                        <div class='result-confidence'>Confidence: {result['confidence']:.2f}%</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    
+            if st.button("Stop Camera ⏹️", key="stop_camera_button", help="Click to stop camera preview"):
+                st.session_state.camera_active = False
+        st.markdown("</div>", unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. Sidebar
-# ─────────────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### About")
-    st.markdown("Upload or snap a photo → get **instant ID + narrated video story** of your bird.")
-    st.markdown("Powered by ResNet34 + `all_birds_video_maker.pth`")
+    # Sidebar info
+    with st.sidebar:
+        st.markdown("""
+        <div class='card fade'>
+          <h4>About</h4>
+          <div class='hint'>This demo helps identify birds commonly found across Uganda. For best results, ensure good lighting and a clear subject.</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-st.markdown("<div style='text-align:center; color:#334155; margin-top:2rem; font-size:.9rem;'>Built with for Uganda's Birds</div>", unsafe_allow_html=True)
+    # Footer
+    st.markdown(
+        """
+        <div style='text-align:center; color:#334155; margin-top: 1rem; font-size:.9rem;'>
+            Built for the Love of Nature
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    # (no wrapper divs to close)
